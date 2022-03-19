@@ -1,0 +1,813 @@
+#!/bin/sh
+#set -xv
+
+# Store the command
+command=`echo "$0 $*" | sed -e "s/configure2/configure/"`
+
+# configure script for Amber and AmberTools: creates config.h
+
+# Extracts and echoes the C and Fortran compiler versions.
+# The first argument is the compiler option to emit the version.
+# These variables are defined: cc_version, cc_version_major, cc_version_minor,
+# cc_version_patch, fc_version, fc_version_major, fc_version_minor,
+# fc_version_patch.
+# Emits an Error message and terminates if a compiler is not found.
+# Example compiler outputs:
+##gcc version 4.1.2 20080704 (Red Hat 4.1.2-54)
+##icc -v
+##Version 10.0
+##icc -v
+##icc version 15.0.0 (gcc version 4.4.7 compatibility)
+##pgcc 9.0-4 64-bit target on x86-64 Linux -tp shanghai-64
+##pgcc (aka pgcc18) 20.1-0 LLVM 64-bit target on x86-64 Linux -tp skylake
+##$ opencc -version
+##Open64 Compiler Suite: Version 4.2.4
+extract_and_emit_compiler_versions() {
+    echo ""
+    echo "Obtaining the $compiler compiler suite versions, e.g.:"
+    echo "     $cc $1"
+    # C
+    basecc=`basename $cc`
+    if [ -z "`which $cc 2> /dev/null`" ]; then
+       echo "Error: $cc could not be found!"
+       exit 1
+    fi
+    # select the line containing the version and extract the version numbers;
+    # explicitly remove words that may contain digits.
+    if [ "$cygwin" = 'yes' ] ; then
+      # Compilers on cygwin can print extra info
+      cc_version=`$cc $1 2>&1 | grep -E "$basecc |[vV]ersion " | grep -v cygwin \
+                  | sed -e 's/Open64//' -e 's/(.*)//' -e 's/^[a-zA-Z :]* //' -e 's/ .*//'`
+    else
+      cc_version=`$cc $1 2>&1 | grep -E "$basecc |[vV]ersion " \
+                  | sed -e 's/Open64//' -e 's/(.*)//' -e 's/^[a-zA-Z :]* //' -e 's/ .*//'`
+    fi
+    if [ -z "$cc_version" ] ; then
+       echo "Error: $cc is not well formed or produces unusual version details!"
+       echo "       Check for a CC environment variable."
+       exit 1
+    else
+       echo "The C version is $cc_version"
+    fi
+    # use '.' as only field delimiter.
+    cc_version=`echo $cc_version | sed -e 's/-/./'`
+    cc_version_major=`echo $cc_version | cut -d'.' -f1`
+    cc_version_minor=`echo $cc_version | cut -d'.' -f2`
+    cc_version_patch=`echo $cc_version | cut -d'.' -f3`
+
+    # Fortran
+    if [ -z "`which $fc 2> /dev/null`" ]; then
+       echo "Error: $fc could not be found!"
+       exit 1
+    fi
+
+    # check osx devil
+    # should only check on OSX?
+    is_clang=`$cc --version |grep clang`
+    if [ ! -z "$is_clang" ]; then
+        if [ "$compiler" = 'gnu' ]; then
+            echo
+            echo "ERROR: Wrong compiler. You specify compiler=$compiler but actually using clang"
+            echo "Please change compiler option to clang, or set correct PATH (or CC, CXX) to GNU compiler"
+            echo
+            exit 1
+        fi
+    else
+        if [ "$compiler" = 'clang' ]; then
+            echo
+            echo "ERROR: Wrong compiler. You specify compiler=$compiler but actually using $cc"
+            echo "Please try to unset CC and CXX environments"
+            echo
+            exit 1
+        fi
+    fi
+
+    # select the line containing the version and extract the version numbers;
+    # explicitly remove words that may contain digits.
+    basefc=`basename $fc`
+    if [ "$cygwin" = 'yes' ] ; then
+      # Compilers on cygwin can print extra info
+      fc_version=`$fc $1 2>&1 | grep -E "$basefc |$basecc |[vV]ersion " | grep -v cygwin | sed -e "s@$basefc @@" \
+                  -e 's/Open64//' -e 's/^[a-zA-Z :]* //' -e 's/ .*//'`
+    else
+      fc_version=`$fc $1 2>&1 | grep -E "$basefc |$basecc |[vV]ersion " | sed -e "s@$basefc @@" \
+                  -e 's/Open64//' -e 's/^[a-zA-Z :]* //' -e 's/ .*//'`
+    fi
+    if [ -z "$fc_version" ] ; then
+      # DRR - Last ditch; compiler name may not be in version string so just
+      #       try to get a number that looks like X.X
+      fc_version=`$fc $1 | grep -o -E "[0-9]*\.[0-9]"`
+    fi
+    if [ -z "$fc_version" ] ; then
+       echo "Error: $fc is not well formed or produces unusual version details!"
+       echo "       Check for an FC environment variable."
+       echo "       Do not use @ characters in an FC environment variable."
+       exit 1
+    else
+       echo "The Fortran version is $fc_version"
+    fi
+    # use '.' as only field delimiter.
+    fc_version=`echo $fc_version | sed -e 's/-/./'`
+    fc_version_major=`echo $fc_version | cut -d'.' -f1`
+    fc_version_minor=`echo $fc_version | cut -d'.' -f2`
+    fc_version_patch=`echo $fc_version | cut -d'.' -f3`
+}
+
+#------------------------------------------------------------------------------
+# Process commandline configuration options:
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+#  Define variables that are currently constants:
+#------------------------------------------------------------------------------
+localcp='cp'
+localmv='mv'
+localrm='rm'
+objsuffix='.o'
+os=`uname -sr | awk -F . '{print $1}'`
+processor=`uname -m`
+if [ -z "$RANLIB" ]; then ranlib='ranlib'; else ranlib="$RANLIB"; fi
+
+#------------------------------------------------------------------------------
+#  Initialize variables that are architecture specific:
+#------------------------------------------------------------------------------
+if [ "$processor" = "em64t" -o "$processor" = "x86_64" ] ; then
+    x86_64='yes'
+else
+    x86_64='no'
+fi
+windows_hostflag=''
+
+#------------------------------------------------------------------------------
+#  Initialize variables that are controlled by commandline options or arguments
+#------------------------------------------------------------------------------
+compiler='unspecified'
+cygwin='no'
+windows='no'
+debug='no'
+fpp="cpp -traditional -P"
+fppflags=''
+freeformat_flag=''
+fwarnflag=''
+gnuld='yes'
+gotolib='no'
+intelmpi='no'
+is_mac='no'
+ldflags=''
+ld='ld '
+lfs='yes'
+lm='-lm'
+macAccelerate='no'
+make_shared='-shared'
+mkl_type=''
+mpi='no'
+openmp='no'
+optimise='yes'
+amberprefix="$AMBERHOME"
+amberhome="$AMBERHOME"
+shared_suffix='.so'
+sse='yes'
+static='no'
+suffix=''
+verbose='@'
+warnflag=''
+pic="-fPIC"
+#------------------------------------------------------------------------------
+#  Initialize variables that are controlled by environment variables:
+#------------------------------------------------------------------------------
+gotolib='no'
+mklinc=''
+
+#------------------------------------------------------------------------------
+#  Checking Arguments:
+#------------------------------------------------------------------------------
+if [ $# -lt 1 ]; then usage; fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -verbose)       verbose='' ;;
+        -mpi)           mpi='yes' ;;
+        -intelmpi)      mpi='yes'; intelmpi='yes'; export MPICC="mpiicc" ;;
+        -openmp)        openmp='yes' ;;
+        -cygwin)        cygwin='yes'; lfs='no'; windows='yes'; suffix='.exe';;
+        -windows)       windows='yes'; suffix='.exe'; static='no';
+                        pic=''; shared_suffix='.dll.a';;
+        -nosse)         sse='no';;
+        -nolfs)         lfs='no';;
+        -static)        static='yes';;
+        -macAccelerate) macAccelerate='yes';;
+        -mkl)           mkl_type='mkl' ;;
+        -nomkl)         mkl_type='off' ;;
+        -debug)         debug='yes';;
+        -noopt)         optimise='no';;
+        --prefix)       shift; amberprefix=$1 ;;
+        -g95)
+            echo "This flag has been removed. Set the FC environment variable to"
+            echo "g95 in order to use g95"; exit 1;;
+        -h|-H|--h|--hel|--help|-help) usage;;
+        -fh|-fullhelp|--full|--fullhelp|--full-|--full-h|--full-he|--full-hel|--full-help) \
+            full_usage;;
+
+        -*) echo "Error: Unknown or misplaced flag: $1"
+            echo "       Usage: ./configure [flags] compiler"
+            echo "       Type './configure -help' for more details."
+            exit 1;;
+
+        *) if [ $# -gt 1 ]; then
+             echo "Error: Unknown or misplaced compiler: $1"
+             echo "       Usage: ./configure [flags] compiler"
+             echo "       Type './configure -help' for more details."
+             exit 1
+           fi
+
+           compiler=$1 ;;
+    esac
+    shift
+done
+
+#-------------------------------------------------------------------------------
+#  Platform specific:
+#-------------------------------------------------------------------------------
+# See if we are cross-compiling for windows
+if [ "$windows" = "yes" ]; then
+    windows_hostflag="--host=x86_64-w64-mingw32"
+fi
+
+# Cygwin-specific settings
+if [ "$cygwin" = 'yes' ] ; then
+  shared_suffix='.dll'
+  pic=''
+fi
+
+if [ `uname -s|awk '{print $1}'` = "Darwin" ]; then
+    is_mac='yes'
+    shared_suffix='.dylib'
+    make_shared='-dynamiclib'
+    static='no'
+elif [ "$macAccelerate" = 'yes' ]; then
+    echo "Warning:  This is not a Macintosh, disabling -macAccelerate."
+    macAccelerate='no'
+fi
+
+# Check if GOTO should be enabled
+if [ -n "$GOTO" ] ; then
+  if [ "$macAccelerate" = 'no' -a "$mkl_type" != 'mkl' ] ; then
+    gotolib='yes'
+    echo "Using optimized BLAS routines in $GOTO"
+    echo ""
+  else
+    echo "Warning: GOTO is set but -mkl/-macAccelerate specified. Ignoring GOTO."
+    echo ""
+  fi
+fi
+
+# Check for math library clashes. Currently no need to check GOTO since that is
+# only enabled if -macAcclerate/-mkl not specified.
+if [ "$macAccelerate" = 'yes' ] ; then
+  if [ "$mkl_type" = 'mkl' ] ; then
+    echo "Error: -mkl is incompatible with -macAccelerate."
+    exit 1
+  fi
+elif [ "$mkl_type" = 'mkl' ] ; then
+  if [ "$macAccelerate" = 'yes' ] ; then
+    echo "Error: -macAccelerate is incompatible with -mkl."
+    exit
+  fi
+fi
+
+# If no other math library specified, see if we want to enable MKL
+if [ "$macAccelerate" = 'no' -a "$gotolib" = 'no' -a -z "$mkl_type" ] ; then
+  # If using Intel compilers or if MKL_HOME is set (backwards compat.), enable MKL.
+  if [ "$compiler" = 'intel' ] ; then
+    echo "Intel compilers in use and no math libraries specified; using Intel MKL."
+    echo "Specify '-nomkl' to prevent this behavior."
+    echo ""
+    mkl_type='mkl'
+  elif [ -n "$MKL_HOME" ] ; then
+    echo "MKL_HOME is set and no math libraries specified; using Intel MKL."
+    echo "Specify '-nomkl' to prevent this behavior."
+    echo ""
+    mkl_type='mkl'
+  fi
+fi
+
+# Determine linker type. Currently only matters for MKL
+ld_version=`ld -v 2>&1 | awk '{print $1}'`
+case "$ld_version" in
+    *GNU*)
+        gnuld='yes';;
+    *)
+        gnuld='no' ;;
+esac
+
+#------------------------------------------------------------------------------
+#  Set up defaults that work for most machines:
+#------------------------------------------------------------------------------
+
+# Note: ambercflags and ambercxxflags should only be passed
+# to code written and/or maintained by the Amber developers
+#  e.g. not to fftw3, netcdf, boost, etc.
+
+cc=cc
+cflags="$pic $CFLAGS"
+cnooptflags=
+coptflags=-O
+ambercflags=
+fflags="$pic $FFLAGS"
+free_format=-FR
+#  Fortran versions, if compiled from source:
+flibsf="-llapack -lblas"
+
+# only used when the user requests a static build or when a static build is
+# automatically set, eg, windows:
+staticflag='-static'
+omp_flag=
+mpi_flag=
+fp_flags=
+flibs_mkl=
+lapack=install
+blas=install
+
+#------------------------------------------------------------------------------
+#  Case statement identifying the architecture/compilers:
+#------------------------------------------------------------------------------
+
+case "$compiler" in
+
+#################### gcc #######
+gnu)
+    if [ "$intelmpi" = 'yes' ]; then
+        echo "Intel MPI must be used with the Intel compilers."
+        exit 1
+    fi
+
+    flibsf_arch=
+    if [ -z "$CC" ]; then cc=gcc; else cc="$CC"; fi
+    cflags="$pic $CFLAGS"
+    ambercflags=""
+    if [ -z "$FC" ]; then fc=gfortran; else fc="$FC"; fi
+    ld="$fc"
+    fflags="$pic $FFLAGS"
+
+    warnflag='-Wall -Wno-unused-function'
+    fwarnflag="$warnflag"
+    # If -noopt has been requested, force lack of optimisation;
+    # otherwise, use the default levels. Since cflags, cxxflags
+    # and fflags are used everywhere, and *optflags and
+    # *nooptflags are not (some parts of Amber and AmberTools use
+    # neither *optflags nor *nooptflags), we'll put -O0 in cflags
+    # and so forth instead.
+    if [ "$optimise" = 'no' ]; then
+      cflags="$cflags -O0"
+      cnooptflags=""
+      coptflags=""
+      fflags="$fflags -O0"
+      fnooptflags=""
+      foptflags=""
+    else
+      cnooptflags=
+      coptflags="-O3"
+      fnooptflags="-O0"
+      foptflags="-O3"
+    fi
+
+    # Debugging options
+    if [ "$debug" = 'yes' ]; then
+      cflags="$cflags -g"
+      fflags="$fflags -g"
+    fi
+
+    extract_and_emit_compiler_versions '-v'
+
+    if [ $fc_version_major -ge 10 ] ; then
+      # Allow argument mismatches for gcc 10
+      fflags="$fflags -fallow-argument-mismatch"
+      # Fix RISM segfaults
+      fflags="$fflags -fno-inline-arg-packing"
+      # Use -fcommon to get cifparse working
+      cflags="$cflags -fcommon"
+    fi
+
+    if [ $cc_version_major -ge 4 -a $cc_version_minor -ge 2 -a "$optimise" = "yes" ]; then
+      if [ $sse = 'yes' ]; then
+        if [ $x86_64 = 'yes' ]; then
+          #-mfpmath=sse is default for x86_64, no need to specific it
+          coptflags="$coptflags -mtune=native"
+          foptflags="$foptflags -mtune=native"
+        fi
+      fi
+      fcreal8="-fdefault-real-8"
+    else
+      fcreal8="-fdefault-real-8"
+    fi
+
+    if [ "$cygwin" = 'yes' ]; then
+        cflags="$cflags -DCYGWIN"
+        fppflags="$fppflags -DCYGWIN"
+        lm=''
+    fi
+
+    freeformat_flag=-ffree-form
+
+    ;;
+
+#################### icc #######
+intel)
+    test -z "$pic" && pic="-fpic"
+    # following appears to work on Intel compilers version 11,2013..
+    flibsf_arch=
+    if [ -z "$CC" ]; then cc=icc; else cc="$CC"; fi
+    cflags="$pic $CFLAGS"
+    ambercflags=""
+    if [ -z "$FC" ]; then fc=ifort; else fc="$FC"; fi
+    ld="$fc"
+    fflags="$pic $FFLAGS"
+    freeformat_flag='-FR'
+    warnflag='-Wall'
+    fwarnflag=''
+    # If -noopt has been requested, force lack of optimisation;
+    # otherwise, use the default levels. Since cflags, cxxflags
+    # and fflags are used everywhere, and *optflags and
+    # *nooptflags are not (some parts of Amber and AmberTools use
+    # neither *optflags nor *nooptflags), we'll put -O0 in cflags
+    # and so forth instead.
+    if [ "$optimise" = 'no' ]; then
+      cflags="$cflags -O0 -std=gnu99"
+      cnooptflags=" -std=gnu99"
+      coptflags=" -std=gnu99"
+      fflags="$fflags -O0"
+      fnooptflags=""
+      foptflags=""
+    else
+      cnooptflags="-std=gnu99"
+      coptflags="-ip -O3 -std=gnu99"
+      fnooptflags="-O0"
+      foptflags="-ip -O3"
+      fp_flags='-fp-model precise -fp-model source'
+    fi
+
+    # Debugging options
+    if [ "$debug" = 'yes' ]; then
+        cflags="$cflags -g -debug all"
+        fflags="$fflags -g -debug all"
+    fi
+
+    extract_and_emit_compiler_versions '-v'
+
+    #OpenMP support requires Intel compiler version 10.2 or higher.
+    if ( [ "$fc_version_major" -eq 10 -a "$fc_version_minor" -lt 2 ] ) \
+            || [ "$fc_version_major" -lt 10 ]; then
+            echo "Error: OpenMP support requires Intel compiler version 10.2 or higher."
+            exit 1
+    fi
+
+    if [ "$openmp" = 'yes' ]; then
+        if [ "$fc_version_major" -ge 16 ]; then
+             omp_flag="-qopenmp -DOPENMP"
+             flibsf_arch="$flibsf_arch -qopenmp"
+        else
+             omp_flag="-openmp -DOPENMP"
+             flibsf_arch="$flibsf_arch -openmp"
+        fi
+      #if [ "$fc_version_major" -lt 11 ] ; then
+      #fi
+    fi
+
+    #How flags get set for optimization depend on whether we have a MIC processor,
+    #  the version of Intel compiler we have, and whether we are cross-compiling
+    #  for multiple versions of SSE support.  The following coordinates all of this.
+    #  This was done assuming that MIC and SSE are mutually exclusive and that we want
+    #  SSE instructions included only when optomize = yes.  Note that use of an
+    #  SSE_TYPES specification needs to be given in place of xHost not in addition to.
+    #  This observed behavior is not what is reported by the Intel man pages. BPK
+
+    if [ "$optimise" = "yes" -a "$sse" = 'yes' ]; then
+      # BPK removed section that modified O1 or O2 to be O3 if optimize was set to yes.
+      #     We already begin with the O3 setting so it wasn't needed.
+        # For both coptflags and foptflags, use the appropriate settings
+        # for the sse flags (compiler version dependent).
+        if [ "$cc_version_major" -ge 11 ] ; then
+            if [ -n "$SSE_TYPES" ] ; then
+                coptflags="$coptflags -ax$SSE_TYPES"
+            else
+                if [ "$mpi" = "no" ] ; then
+                   coptflags="$coptflags -xHost"
+                fi
+            fi
+        else
+            coptflags="$coptflags -axSTPW"
+        fi
+
+        if [ "$fc_version_major" -ge 11 ] ; then
+            if [ -n "$SSE_TYPES" ] ; then
+                foptflags="$foptflags -ax$SSE_TYPES"
+            else
+                if [ "$mpi" = "no" ] ; then
+                   foptflags="$foptflags -xHost"
+                fi
+            fi
+        else
+            foptflags="$foptflags -axSTPW"
+        fi
+
+        flibsf_arch="$flibsf_arch -lsvml"
+    fi
+
+    if [ $cc_version_major -lt 11 ]; then
+       ldflags="$ldflags -lsvml"
+    fi
+
+    ;;
+
+#################### clang ####
+clang)
+    if [ "$intelmpi" = 'yes' ]; then
+        echo "Intel MPI must be used with the Intel compilers."
+        exit 1
+    fi
+
+    flibsf_arch=
+    if [ -z "$CC" ]; then cc=clang; else cc="$CC"; fi
+    cflags="$pic"
+    ambercflags=""
+    if [ -z "$FC" ]; then fc=gfortran; else fc="$FC"; fi
+    ld="$fc"
+    fflags="$pic"
+    warnflag="-Wall -Wno-unused-function"
+    fwarnflag="$warnflag"
+    # If -noopt has been requested, force lack of optimisation;
+    # otherwise, use the default levels. Since cflags, cxxflags
+    # and fflags are used everywhere, and *optflags and
+    # *nooptflags are not (some parts of Amber and AmberTools use
+    # neither *optflags nor *nooptflags), we'll put -O0 in cflags
+    # and so forth instead.
+    if [ "$optimise" = 'no' ]; then
+      cflags="$cflags -O0"
+      cnooptflags=""
+      coptflags=""
+      fflags="$fflags -O0"
+      fnooptflags=""
+      foptflags=""
+    else
+      cnooptflags=
+      coptflags="-O3"
+      fnooptflags="-O0"
+      foptflags="-O3 -mtune=native"
+    fi
+
+    # Debugging options
+    if [ "$debug" = 'yes' ]; then
+      cflags="$cflags -g"
+      fflags="$fflags -g"
+    fi
+
+    fcreal8="-fdefault-real-8"
+
+    if [ "$openmp" = 'yes' ]; then
+        echo "OpenMP and clang are not currently compatible"
+        exit 1
+
+        # In case clang starts supporting OpenMP soon, keep the code here.
+        omp_flag="-fopenmp -DOPENMP"
+        flibsf_arch="$flibsf_arch -fopenmp"
+    fi
+
+    freeformat_flag=-ffree-form
+
+    extract_and_emit_compiler_versions "-v"
+    ;;
+#################### unknown choice #######
+*)
+    echo "Error: Architecture/compiler '$compiler' is not supported!"
+    echo "       Usage: ./configure [flags] compiler"
+    echo "       Type './configure -help' for more details."
+    exit 1
+    ;;
+
+esac
+
+#--------------------------------------------------------------------------
+#  Configure the MKL or GOTO etc libraries for BLAS/LAPACK.
+#--------------------------------------------------------------------------
+if [ "$mkl_type" = 'mkl' ] ; then
+  lapack=skip
+  blas=skip
+  flibsf=""
+  fppflags="$fppflags -DMKL"
+  # Determine MKL home directory
+  mklroot=''
+  if [ ! -z "$MKLROOT" ] ; then
+    mklroot=$MKLROOT
+  elif [ ! -z "$MKL_HOME" ] ; then
+    mklroot=$MKL_HOME
+  fi
+  echo ""
+  if [ ! -z "$mklroot" ] ; then
+    echo "Using MKL for BLAS/LAPACK in $mklroot"
+    mklinc="-I$mklroot/include"
+  else
+    echo "Using MKL for BLAS/LAPACK"
+  fi
+  # Determine how we are linking MKL
+  link_type='mkl'
+  if  [ "$compiler" = 'intel' ] ; then
+    if [ "$cc_version_major" -lt 11 -o "$fc_version_major" -lt 11 ] ; then
+      link_type='line'
+    fi
+  else
+    link_type='line'
+  fi
+  # We always link to the sequential version of MKL since typically
+  # one runs an MPI thread for each core.  However, if openmp is
+  # specified, for example to turn on SMP diagonalizers for QMMM
+  # then we link to the threaded version of MKL and inside the code
+  # the number of threads for vector functions etc will be set to 1.
+  # Always link static version of MKL - just easier from an end
+  # user perspective.
+  if [ "$link_type" = 'line' ] ; then
+    # ----- Link line advisor style. Requires MKLROOT ------
+    if [ -z "$mklroot" ] ; then
+      echo "Error: MKLROOT/MKL_HOME not set." > /dev/stderr
+      exit 1
+    fi
+    mkll="$mklroot/lib/32"
+    mkl_procstring="ia32" # TODO can probably be deprecated
+    mklinterfacelayer='libmkl_intel.a'
+    if [ "$is_mac" = 'yes' ] ; then
+      mkll="$mklroot/lib"
+      if [ "$x86_64" = 'yes' ]; then
+        mklinterfacelayer='libmkl_intel_lp64.a'
+      fi
+    elif [ "$x86_64" = 'yes' ]; then
+      if [ -d "$mklroot/lib/em64t" ]; then
+        mkll="$mklroot/lib/em64t"
+        mkl_procstring="em64t"
+      else
+        mkll="$mklroot/lib/intel64"
+        mkl_procstring="intel64"
+      fi
+      # lp64 is 32 bit integers on 64 bit platforms
+      mklinterfacelayer='libmkl_intel_lp64.a'
+    fi
+    # Determing threading interface if necessary
+    mklthread="$mkll/libmkl_sequential.a"
+    mklomp=''
+    if [ "$openmp" = 'yes' ] ; then
+      if [ "$compiler" = 'intel' ] ; then
+        mklthread="$mkll/libmkl_intel_thread.a"
+        mklomp='-liomp5'
+      else
+        mklthread="$mkll/libmkl_gnu_thread.a"
+        mklomp='-lgomp'
+      fi
+      if [ "$is_mac" = 'yes' -a "$compiler" != 'intel' ] ; then
+        echo "Warning: OpenMP MKL not supported on OSX without Intel compilers. Using sequential."
+        mklthread="$mkll/libmkl_sequential.a"
+        mklomp=''
+      fi
+    fi
+    # Set link flags
+    if [ "$gnuld" = 'yes' ]; then
+      echo "GNU linker assumed."
+      flibs_mkl="-Wl,--start-group $mkll/$mklinterfacelayer $mklthread $mkll/libmkl_core.a -Wl,--end-group $mklomp -lpthread"
+    else
+      echo "Non-GNU linker assumed."
+      flibs_mkl="-L$mkll $mkll/$mklinterfacelayer $mklthread $mkll/libmkl_core.a -lpthread"
+    fi
+    # GNU compilers with MKL requires -ldl
+    if [ "$compiler" = 'gnu' ]; then
+      flibs_mkl="$flibs_mkl -ldl"
+    fi
+  else
+    # ----- Use simple flag for Intel compilers ------------
+    if [ "$openmp" = 'yes' ]; then
+      flibs_mkl='-mkl'
+    else
+      flibs_mkl='-mkl=sequential'
+    fi
+  fi
+elif [ "$gotolib" = 'yes' ]; then
+    lapack=skip
+    blas=skip
+    flibsf="$GOTO -lpthread"
+elif [ "$macAccelerate" = 'yes' ] ; then
+    lapack=skip
+    blas=skip
+    flibsf=""
+    flibsf_arch="$flibsf_arch -framework Accelerate"
+fi
+
+#--------------------------------------------------------------------------
+#  Support platforms without <sys/dir.h> but with <dirent.h>
+#  usually a non-Linux Unix with a non-native compiler.
+#--------------------------------------------------------------------------
+if [ ! -r /usr/include/sys/dir.h  -a -r /usr/include/dirent.h ]; then
+    if [ "$cygwin" != 'yes' ]; then
+       cflags="$cflags -DSYSV"
+    fi
+fi
+
+#--------------------------------------------------------------------------
+#  Check for large file support:
+#--------------------------------------------------------------------------
+if [ "$lfs" = 'yes' ]; then
+    cflags="$cflags -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE"
+fi
+
+#------------------------------------------------------------------------------
+#  Set up the static flags:
+#------------------------------------------------------------------------------
+if [ "$static" = 'yes' ]; then
+    ldflags="$ldflags $staticflag"
+fi
+
+#------------------------------------------------------------------------------
+#  Finally, write out the config.h file:
+#------------------------------------------------------------------------------
+
+if [ -z "$AR" ]; then ar='ar'; else ar="$AR"; fi
+
+cat <<EOD > config.h
+#  Amber configuration file.
+#  Created at `date` via $command
+
+AMBER_PREFIX=$amberprefix
+BINDIR=$amberprefix/bin
+LIBDIR=$amberprefix/lib
+INCDIR=$amberprefix/include
+
+#  Set the C compiler, etc.
+
+#   The compiler flags CFLAGS and CXXFLAGS should always be used.
+#   By contrast, *OPTFLAGS and *NOOPTFLAGS will only be used with
+#   certain files, and usually at compile-time but not link-time.
+#   Where *OPTFLAGS and *NOOPTFLAGS are requested (in Makefiles,
+#   makedepend and depend), they should come before CFLAGS or
+#   CXXFLAGS; this allows the user to override *OPTFLAGS and
+#   *NOOPTFLAGS using the BUILDFLAGS variable.
+
+#   AMBERBUILDFLAGS provides a hook into all stages of the build process.
+#   It can be used to build debug versions, invoke special features, etc.
+#   Example:  make AMBERBUILDFLAGS='-O0 -g' sander
+#
+CC=$cc
+CFLAGS=$cflags $mpi_flag \$(CUSTOMBUILDFLAGS) $mklinc \$(AMBERBUILDFLAGS)
+CNOOPTFLAGS=$cnooptflags
+COPTFLAGS=$coptflags $omp_flag
+AMBERCFLAGS=$ambercflags \$(AMBERBUILDFLAGS)
+WARNFLAGS=$warnflag
+
+LDFLAGS=$ldflags \$(CUSTOMBUILDFLAGS) \$(AMBERBUILDFLAGS)
+AMBERLDFLAGS=\$(AMBERBUILDFLAGS)
+
+AR=    $ar rv
+RANLIB=$ranlib
+VB=$verbose
+
+#  Set the C-preprocessor.
+
+CPP=$cpp
+
+#  These variables control whether we will use compiled versions of BLAS
+#  and LAPACK (which are generally slower), or whether those libraries are
+#  already available (presumably in an optimized form).
+
+LAPACK=$lapack
+BLAS=$blas
+
+#  For Windows/cygwin, set SFX to ".exe"; for Unix/Linux leave it empty:
+#  Set OBJSFX to ".obj" instead of ".o" on Windows:
+
+SFX=$suffix
+OSFX=$objsuffix
+MV=$localmv
+RM=$localrm
+CP=$localcp
+
+#  Information about Fortran compilation:
+
+FC=$fc
+FFLAGS=$fflags \$(LOCALFLAGS) \$(CUSTOMBUILDFLAGS) -I\$(INCDIR) $mklinc \$(AMBERBUILDFLAGS)
+FNOOPTFLAGS=$fnooptflags
+FOPTFLAGS=$foptflags $omp_flag
+AMBERFFLAGS=\$(AMBERBUILDFLAGS)
+FREEFORMAT_FLAG=$freeformat_flag
+LM=$lm
+FPP=$fpp
+FPPFLAGS=$fppflags $mpi_flag \$(CUSTOMBUILDFLAGS) \$(AMBERBUILDFLAGS)
+AMBERFPPFLAGS=\$(AMBERBUILDFLAGS)
+FCREAL8=$fcreal8
+FWARNFLAGS=$fwarnflag
+
+# SQM specific build flags
+SQM_FLIBSF=$flibsf $flibs_mkl $flibsf_arch
+
+# OS-specific rules for making shared objects
+SHARED_SUFFIX=$shared_suffix
+MAKE_SHARED=$make_shared
+EOD
+
+echo " "
+echo "The configuration file, config.h, was successfully created."
+echo " "
+
+exit
